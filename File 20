@@ -1,0 +1,256 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# --- 1. Synthetic Data Generation ---
+# We'll simulate three main parameters:
+# 1. Ground Deformation (e.g., tiltmeter or GPS data) - often shows inflation before eruption
+# 2. Seismic Activity (e.g., event count or amplitude) - increases before eruption
+# 3. Gas Emissions (e.g., SO2 flux) - can increase or change composition before eruption
+
+def generate_volcanic_data(num_days=365 * 2, eruption_days=None, noise_level=0.1):
+    """
+    Generates synthetic time-series data for volcanic monitoring.
+    Simulates pre-eruption signals around specified eruption days.
+    """
+    dates = pd.date_range(start='2023-01-01', periods=num_days, freq='D')
+    
+    # Base levels
+    deformation = np.random.rand(num_days) * 0.1 + 0.5 # Small background deformation
+    seismic = np.random.randint(50, 100, num_days) # Background seismic events
+    gas_emission = np.random.rand(num_days) * 10 + 50 # Background gas emission
+
+    # Eruption signals
+    eruption_events = np.zeros(num_days, dtype=int) # 0 for no eruption, 1 for eruption day
+
+    if eruption_days is None:
+        # If no specific eruption days are given, randomly select a few
+        num_eruptions = np.random.randint(1, 3)
+        eruption_days = np.random.choice(num_days - 30, num_eruptions, replace=False) + 30 # Ensure buffer
+        
+    for eruption_day_idx in eruption_days:
+        # Simulate pre-eruption inflation for deformation
+        pre_eruption_window = 30 # days before eruption
+        for i in range(max(0, eruption_day_idx - pre_eruption_window), eruption_day_idx):
+            # Gradual increase, peaking at eruption day
+            factor = (i - (eruption_day_idx - pre_eruption_window)) / pre_eruption_window
+            deformation[i] += factor * 0.5 + np.random.rand() * 0.05
+
+        # Simulate increased seismic activity
+        seismic_window = 20 # days before eruption
+        for i in range(max(0, eruption_day_idx - seismic_window), eruption_day_idx):
+            factor = (i - (eruption_day_idx - seismic_window)) / seismic_window
+            seismic[i] += int(factor * 200 + np.random.randint(0, 20))
+
+        # Simulate increased gas emission
+        gas_window = 15 # days before eruption
+        for i in range(max(0, eruption_day_idx - gas_window), eruption_day_idx):
+            factor = (i - (eruption_day_idx - gas_window)) / gas_window
+            gas_emission[i] += factor * 30 + np.random.rand() * 5
+
+        # Mark the eruption day
+        if eruption_day_idx < num_days:
+            eruption_events[eruption_day_idx] = 1 # Mark eruption on the day
+
+    # Add random noise
+    deformation += np.random.normal(0, noise_level, num_days)
+    seismic += np.random.normal(0, noise_level * 10, num_days)
+    gas_emission += np.random.normal(0, noise_level * 5, num_days)
+
+    # Ensure non-negative values
+    deformation = np.maximum(0, deformation)
+    seismic = np.maximum(0, seismic)
+    gas_emission = np.maximum(0, gas_emission)
+
+    df = pd.DataFrame({
+        'date': dates,
+        'deformation': deformation,
+        'seismic_activity': seismic,
+        'gas_emission': gas_emission,
+        'eruption_event': eruption_events # This is our target variable (0 or 1)
+    })
+    df = df.set_index('date')
+    return df, eruption_days
+
+# Generate data for 2 years with a couple of simulated eruptions
+np.random.seed(42) # for reproducibility
+synthetic_data, actual_eruption_days_indices = generate_volcanic_data(
+    num_days=365 * 2,
+    eruption_days=[200, 500] # Eruptions on day 200 and day 500
+)
+
+print("Synthetic Data Head:")
+print(synthetic_data.head())
+print("\nSynthetic Data Tail:")
+print(synthetic_data.tail())
+
+# Plot the synthetic data to visualize eruption signals
+plt.figure(figsize=(15, 10))
+
+plt.subplot(4, 1, 1)
+plt.plot(synthetic_data.index, synthetic_data['deformation'], label='Ground Deformation')
+plt.title('Synthetic Volcanic Monitoring Data')
+plt.ylabel('Deformation')
+plt.grid(True)
+for day_idx in actual_eruption_days_indices:
+    plt.axvline(synthetic_data.index[day_idx], color='red', linestyle='--', alpha=0.7, label='Eruption Day' if day_idx == actual_eruption_days_indices[0] else "")
+plt.legend()
+
+plt.subplot(4, 1, 2)
+plt.plot(synthetic_data.index, synthetic_data['seismic_activity'], label='Seismic Activity')
+plt.ylabel('Seismic Events')
+plt.grid(True)
+for day_idx in actual_eruption_days_indices:
+    plt.axvline(synthetic_data.index[day_idx], color='red', linestyle='--', alpha=0.7)
+
+plt.subplot(4, 1, 3)
+plt.plot(synthetic_data.index, synthetic_data['gas_emission'], label='Gas Emission')
+plt.ylabel('Gas Emission')
+plt.grid(True)
+for day_idx in actual_eruption_days_indices:
+    plt.axvline(synthetic_data.index[day_idx], color='red', linestyle='--', alpha=0.7)
+
+plt.subplot(4, 1, 4)
+plt.plot(synthetic_data.index, synthetic_data['eruption_event'], label='Eruption Event (Target)', color='purple')
+plt.ylabel('Eruption (0/1)')
+plt.xlabel('Date')
+plt.grid(True)
+for day_idx in actual_eruption_days_indices:
+    plt.axvline(synthetic_data.index[day_idx], color='red', linestyle='--', alpha=0.7)
+
+plt.tight_layout()
+plt.show()
+
+
+# --- 2. Data Preprocessing for Deep Learning ---
+
+# Define features (X) and target (y)
+features = ['deformation', 'seismic_activity', 'gas_emission']
+X = synthetic_data[features].values
+y = synthetic_data['eruption_event'].values # Our target: 0 or 1 for eruption
+
+# Normalize features
+scaler = MinMaxScaler(feature_range=(0, 1))
+X_scaled = scaler.fit_transform(X)
+
+# Create sequences for LSTM
+# We want to predict if an eruption will happen in the next `forecast_horizon` days
+# based on the last `look_back` days of data.
+look_back = 30 # Use last 30 days of data to predict
+forecast_horizon = 7 # Predict if eruption happens in the next 7 days
+
+def create_sequences(data, target, look_back, forecast_horizon):
+    X_seq, y_seq = [], []
+    for i in range(len(data) - look_back - forecast_horizon + 1):
+        # Input sequence (look_back days of features)
+        X_seq.append(data[i:(i + look_back), :])
+        
+        # Target (1 if any eruption event occurs within the forecast_horizon, else 0)
+        # We are looking for an eruption *after* the look_back window
+        eruption_in_horizon = 1 if np.any(target[(i + look_back):(i + look_back + forecast_horizon)] == 1) else 0
+        y_seq.append(eruption_in_horizon)
+    return np.array(X_seq), np.array(y_seq)
+
+X_sequences, y_labels = create_sequences(X_scaled, y, look_back, forecast_horizon)
+
+print(f"\nShape of X_sequences (samples, timesteps, features): {X_sequences.shape}")
+print(f"Shape of y_labels (samples,): {y_labels.shape}")
+
+# Split data into training and testing sets
+train_size = int(len(X_sequences) * 0.8)
+X_train, X_test = X_sequences[:train_size], X_sequences[train_size:]
+y_train, y_test = y_labels[:train_size], y_labels[train_size:]
+
+print(f"Training samples: {len(X_train)}, Testing samples: {len(X_test)}")
+
+# --- 3. Model Architecture (LSTM) ---
+
+model = Sequential([
+    LSTM(units=50, return_sequences=True, input_shape=(look_back, X_train.shape[2])),
+    Dropout(0.2),
+    LSTM(units=50, return_sequences=False),
+    Dropout(0.2),
+    Dense(units=1, activation='sigmoid') # Sigmoid for binary classification (eruption or no eruption)
+])
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+model.summary()
+
+# --- 4. Model Training ---
+
+# Use EarlyStopping to prevent overfitting
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+print("\nTraining the LSTM model...")
+history = model.fit(
+    X_train, y_train,
+    epochs=100, # Can be increased, early stopping will manage
+    batch_size=32,
+    validation_split=0.2, # Use 20% of training data for validation
+    callbacks=[early_stopping],
+    verbose=1
+)
+
+print("\nTraining complete.")
+
+# Plot training history
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --- 5. Prediction/Forecasting ---
+
+print("\nEvaluating the model on test data...")
+loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test Loss: {loss:.4f}")
+print(f"Test Accuracy: {accuracy:.4f}")
+
+# Make predictions on the test set
+y_pred_proba = model.predict(X_test)
+y_pred = (y_pred_proba > 0.5).astype(int) # Convert probabilities to binary predictions
+
+print("\nSample Predictions vs Actual (Test Set):")
+for i in range(10): # Print first 10 predictions
+    print(f"Predicted: {y_pred[i][0]}, Actual: {y_test[i]}, Probability: {y_pred_proba[i][0]:.4f}")
+
+# --- Demonstrate a single prediction for a new sequence ---
+# Let's take the last 'look_back' days from the original scaled data
+# and try to predict if an eruption will happen in the next 'forecast_horizon' days.
+if len(X_scaled) >= look_back:
+    last_sequence = X_scaled[-look_back:].reshape(1, look_back, X_scaled.shape[1])
+    
+    print(f"\nPredicting for the last {look_back} days of synthetic data:")
+    prediction_proba = model.predict(last_sequence)[0][0]
+    prediction_binary = (prediction_proba > 0.5).astype(int)
+
+    print(f"Predicted probability of eruption in next {forecast_horizon} days: {prediction_proba:.4f}")
+    print(f"Binary prediction (0=No Eruption, 1=Eruption): {prediction_binary}")
+
+    # Check if an actual eruption occurred in the corresponding period for this prediction
+    # This is for understanding, not part of the model's direct output
+    actual_future_eruption = 1 if np.any(y[-forecast_horizon:] == 1) else 0
+    print(f"Actual eruption in the next {forecast_horizon} days (for this final period): {actual_future_eruption}")
+else:
+    print("\nNot enough data to form a 'last_sequence' for prediction.")
